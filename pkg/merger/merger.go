@@ -31,6 +31,8 @@ func NewMerger(mergeFunction func(ctx context.Context, inputChan []chan byte, ou
 	}
 }
 
+// Run starts the Merger's lifecycle. It connects to the downstream operator instance, starts to tcp listeners for the
+// upstream processing functions, it currently only accepts a fixed size of incoming connections (which can be merged).
 func (m *Merger) Run(ctx context.Context, cancelFunc context.CancelFunc) error {
 	defer cancelFunc()
 
@@ -49,7 +51,6 @@ func (m *Merger) Run(ctx context.Context, cancelFunc context.CancelFunc) error {
 	inputConnections := make([]net.Conn, m.FixedInputSize)
 	for i := 0; i < m.FixedInputSize; i++ {
 		// Where do we know which processor-function is 1/2/3/4 ...? -> Maybe Prefix/or Container Names/...
-		// Why does this not block here?
 		conn, err := inListener.Accept()
 		if err != nil {
 			return err
@@ -76,6 +77,10 @@ func (m *Merger) Run(ctx context.Context, cancelFunc context.CancelFunc) error {
 	}
 }
 
+// HandleConnections starts the three core pipelines of the Merger:
+// - It spawns for every processing function's incoming connection a thread that reads bytes and pushes them into one of the InputChannels.
+// - It uses another thread to let the actual MergeFunction run async
+// - It spawns one thread for the writeToOutputConn which forwards bytes from the OutputChannel to the downstream TCP Connection.
 func (m *Merger) HandleConnections(ctx context.Context, inputConnections []net.Conn, outputConn net.Conn) error {
 	defer outputConn.Close()
 
@@ -83,7 +88,7 @@ func (m *Merger) HandleConnections(ctx context.Context, inputConnections []net.C
 	for i, conn := range inputConnections {
 		idx, c := i, conn
 		go func() {
-			if err := passIncomingBytes(ctx, c, m.InputChannels[idx]); err != nil {
+			if err := passIncomingBytes(ctx, m.InputChannels[idx], c); err != nil {
 				errChan <- err
 			}
 		}()
@@ -111,7 +116,8 @@ func (m *Merger) HandleConnections(ctx context.Context, inputConnections []net.C
 	return nil
 }
 
-func passIncomingBytes(ctx context.Context, conn net.Conn, ch chan byte) error {
+// passIncomingBytes reads from a single connection and writes the bytes to the input channel
+func passIncomingBytes(ctx context.Context, ch chan byte, conn net.Conn) error {
 	defer conn.Close()
 
 	buf := make([]byte, 1)
@@ -131,6 +137,8 @@ func passIncomingBytes(ctx context.Context, conn net.Conn, ch chan byte) error {
 	}
 }
 
+// writeToOutputConn pulls bytes from the output channel of the merge function and forwards them,
+// to the connection to the downstream service.
 func writeToOutputConn(ctx context.Context, ch chan byte, conn net.Conn) error {
 	defer conn.Close()
 	for {
