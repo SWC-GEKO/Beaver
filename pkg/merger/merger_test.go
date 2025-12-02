@@ -17,8 +17,6 @@ func startDownstreamServer(t *testing.T, address string, wg *sync.WaitGroup, exp
 		t.Fatalf("unexpected behavior creating a listener for downstream server: %v", err)
 	}
 
-	log.Printf("downstream: successfully connected to merger: %v", ln.Addr())
-
 	received := 0
 	for {
 		conn, err := ln.Accept()
@@ -28,13 +26,11 @@ func startDownstreamServer(t *testing.T, address string, wg *sync.WaitGroup, exp
 
 		buf := make([]byte, 1)
 		for {
-			log.Printf("downstream: waiting to be able to read")
 			_, err := conn.Read(buf)
 			if err != nil {
 				return
 			}
 
-			log.Printf("received: %s", string(buf[0]))
 			ch <- buf[0]
 			received++
 			log.Printf("received %d bytes, expected bytes %d", received, expectedBytes)
@@ -57,16 +53,13 @@ func startUpstreamServer(t *testing.T, address string, rune byte, wg *sync.WaitG
 	if err != nil {
 		t.Fatalf("unexpected error from dial: %v", err)
 	}
-	log.Printf("upstream: successfully connected to merger with addr: %v", conn.RemoteAddr())
 
 	_, err = conn.Write([]byte{rune})
 	if err != nil {
 		t.Errorf("unexpected error writing to merger: %v", err)
 	}
-	log.Printf("upstream: successfully wrote my rune: %s", string(rune))
 }
 
-// ConcatReverseFunction was written by gpt
 func ConcatReverseFunction(ctx context.Context, in []chan byte, out chan byte) error {
 	for {
 		var outArr []byte
@@ -108,7 +101,6 @@ func TestMerger_Run(t *testing.T) {
 	time.Sleep(1 * time.Second)
 
 	go func() {
-		log.Printf("starting to run merger")
 		if err := merger.Run(context.WithTimeout(context.Background(), 200*time.Second)); err != nil {
 			t.Errorf("merger run returned error: %v", err)
 		}

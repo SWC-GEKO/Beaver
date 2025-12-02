@@ -55,8 +55,6 @@ func (m *Merger) Run(ctx context.Context, cancelFunc context.CancelFunc) error {
 			return err
 		}
 
-		log.Printf("successfully connected to input connection with addr: %v", conn.RemoteAddr())
-
 		m.InputChannels[i] = make(chan byte)
 
 		inputConnections[i] = conn
@@ -83,7 +81,6 @@ func (m *Merger) HandleConnections(ctx context.Context, inputConnections []net.C
 
 	errChan := make(chan error)
 	for i, conn := range inputConnections {
-		log.Printf("%d connection is: %v", i, conn.RemoteAddr())
 		idx, c := i, conn
 		go func() {
 			if err := passIncomingBytes(ctx, c, m.InputChannels[idx]); err != nil {
@@ -117,7 +114,6 @@ func (m *Merger) HandleConnections(ctx context.Context, inputConnections []net.C
 func passIncomingBytes(ctx context.Context, conn net.Conn, ch chan byte) error {
 	defer conn.Close()
 
-	log.Printf("starting to pass incoming bytes")
 	buf := make([]byte, 1)
 	for {
 		select {
@@ -131,7 +127,6 @@ func passIncomingBytes(ctx context.Context, conn net.Conn, ch chan byte) error {
 			return fmt.Errorf("passing incoming bytes of conn to: %v failed with err: %v", conn.RemoteAddr(), err)
 		}
 
-		log.Printf("red byte: %s passing it to chan: %v", string(buf[0]), ch)
 		ch <- buf[0]
 	}
 }
