@@ -1,4 +1,4 @@
-package merger
+package main
 
 import (
 	"context"

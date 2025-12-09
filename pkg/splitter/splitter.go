@@ -1,4 +1,4 @@
-package splitter
+package main
 
 import (
 	"fmt"
@@ -25,6 +25,10 @@ func NewSplitter(
 	inputChannel := make(chan byte)
 	outputChannels := make([]chan byte, fixedFunction)
 
+	for i := 0; i < len(outputChannels); i++ {
+		outputChannels[i] = make(chan byte)
+	}
+
 	return &Splitter{
 		SplitFunction:     splitFunction,
 		InputChannel:      inputChannel,
@@ -43,10 +47,15 @@ func (s *Splitter) Run() error {
 	}
 	defer inputListener.Close()
 
+	log.Printf("started listening on: %v", inputListener.Addr())
+
 	var fnConnections []net.Conn
 	for _, fn := range s.FunctionsIPs {
-		fnConn, err := net.Dial("tcp", fn)
+		fnConn, err := net.Dial("tcp", fn+":8000")
 		if err != nil {
+			for _, c := range fnConnections {
+				c.Close()
+			}
 			return fmt.Errorf("connecting to function failed with err: %v", err)
 		}
 		defer fnConn.Close()
@@ -70,12 +79,14 @@ func (s *Splitter) HandleConnections(upstreamConn net.Conn, functionConns []net.
 
 	errChan := make(chan error)
 	go func() {
+		log.Printf("Input-Channel: %v", s.InputChannel)
 		if err := handleIncomingBytes(upstreamConn, s.InputChannel); err != nil {
 			errChan <- err
 		}
 	}()
 
 	go func() {
+		log.Printf("starting the split function: InputChan: %v, OutputChans: %v", s.InputChannel, s.OutputChannels)
 		if err := s.SplitFunction(s.InputChannel, s.OutputChannels); err != nil {
 			errChan <- err
 		}
@@ -83,9 +94,10 @@ func (s *Splitter) HandleConnections(upstreamConn net.Conn, functionConns []net.
 
 	// This will cause a problem when our len(outputChannels) > len(fnConns)
 	for i, ch := range s.OutputChannels {
-		idx, channel := i, ch
+		fn := functionConns[i]
+		channel := ch
 		go func() {
-			if err := writeBytesToFunction(channel, functionConns[idx]); err != nil {
+			if err := writeBytesToFunction(channel, fn); err != nil {
 				errChan <- err
 			}
 		}()
@@ -99,8 +111,8 @@ func (s *Splitter) HandleConnections(upstreamConn net.Conn, functionConns []net.
 }
 
 func handleIncomingBytes(upstreamConn net.Conn, inputChan chan byte) error {
-	buf := make([]byte, 1)
 	for {
+		buf := make([]byte, 1)
 		_, err := upstreamConn.Read(buf)
 		if err != nil {
 			return fmt.Errorf("reading from upstream connection failed with error: %v", err)
@@ -114,6 +126,7 @@ func writeBytesToFunction(outputChan chan byte, functionConn net.Conn) error {
 	for {
 		b, ok := <-outputChan
 		if !ok {
+			log.Printf("output: reading from outputChan failed")
 			return nil
 		}
 

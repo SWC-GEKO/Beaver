@@ -1,0 +1,65 @@
+services:
+  merger:
+    build:
+      context: .
+      dockerfile: ./pkg/merger/Dockerfile
+    container_name: merger
+    restart: no
+    ports:
+      - "9000:9000"
+    networks:
+      - test
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/health" ]
+      interval: 10s
+      timeout: 2s
+      retries: 5
+      start_period: 1s
+
+  processor:
+    build:
+      context: .
+      dockerfile: ./pkg/processor/Dockerfile
+    restart: no
+    networks:
+      - test
+    deploy:
+      replicas: 5
+      restart_policy:
+        condition: none
+    depends_on:
+      merger:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9001/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 1s
+
+  splitter:
+    build:
+      context: .
+      dockerfile: ./pkg/splitter/Dockerfile
+    container_name: splitter
+    restart: no
+    ports:
+      - "8000:8000"
+      - "9002:9002"
+    networks:
+      - test
+    depends_on:
+      processor:
+        condition: service_healthy
+    healthcheck:
+      test: [ "CMD" , "curl", "-f", "http://localhost:9002/health" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 1s
+
+
+
+networks:
+  test:
+    name: test

@@ -1,7 +1,8 @@
-package processor
+package main
 
 import (
 	"fmt"
+	"log"
 	"net"
 )
 
@@ -24,10 +25,13 @@ func (h *Handler) Run() error {
 		return fmt.Errorf("listening from port: %s failed with err: %v", h.InputPort, err)
 	}
 
-	outputConn, err := net.Dial("tcp", h.OutputIP)
+	log.Printf("listening on: %v", inputListener.Addr())
+
+	outputConn, err := net.Dial("tcp", h.OutputIP+":8000")
 	if err != nil {
 		return fmt.Errorf("dialing merger failed with err: %v", err)
 	}
+	log.Printf("successfully connected to merger: %v", outputConn.RemoteAddr())
 
 	inputConn, err := inputListener.Accept()
 	if err != nil {
@@ -49,16 +53,17 @@ func (h *Handler) Run() error {
 }
 
 func (h *Handler) HandleConnection(inputConn net.Conn, outputConn net.Conn) error {
-	buf := make([]byte, 1)
+
 	for {
+		buf := make([]byte, 1)
 		_, err := inputConn.Read(buf)
 		if err != nil {
 			return err
 		}
 
-		// TODO: implement function call
+		res := fn(buf)
 
-		_, err = outputConn.Write(buf)
+		_, err = outputConn.Write(res)
 		if err != nil {
 			return err
 		}
