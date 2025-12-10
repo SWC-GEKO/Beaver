@@ -2,7 +2,7 @@ FROM golang:latest
 
 WORKDIR /app
 
-COPY ../../go.mod ./
+COPY ../../../go.mod ./
 RUN go mod download
 
 COPY . .
@@ -14,6 +14,6 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends curl \
     && rm -rf /var/lib/apt/lists/*
 
-RUN go build -o ./processor ./pkg/processor
+RUN go build -o ./processor ./pkg/function/processor
 
 CMD ["./processor"]

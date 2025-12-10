@@ -2,7 +2,7 @@ services:
   merger:
     build:
       context: .
-      dockerfile: ./pkg/merger/Dockerfile
+      dockerfile: pkg/function/merger/Dockerfile
     container_name: merger
     restart: no
     ports:
@@ -19,7 +19,7 @@ services:
   processor:
     build:
       context: .
-      dockerfile: ./pkg/processor/Dockerfile
+      dockerfile: pkg/function/processor/Dockerfile
     restart: no
     networks:
       - test
@@ -40,7 +40,7 @@ services:
   splitter:
     build:
       context: .
-      dockerfile: ./pkg/splitter/Dockerfile
+      dockerfile: pkg/function/splitter/Dockerfile
     container_name: splitter
     restart: no
     ports:

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"io"
 	"log"
 	"net"
 	"os"
@@ -45,8 +46,13 @@ func main() {
 
 func Run(conn net.Conn, f *os.File) error {
 	buf := make([]byte, 1)
+
 	for {
 		i, err := conn.Read(buf)
+
+		if err == io.EOF {
+			return nil
+		}
 		if err != nil {
 			return err
 		}

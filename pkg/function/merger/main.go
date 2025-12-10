@@ -17,7 +17,9 @@ func main() {
 	functionCount := 5
 	downstreamIP := "host.docker.internal:10000"
 
-	merger := NewMerger(fn, functionCount, inputPort, downstreamIP)
+	opts := DefaultOpts(downstreamIP, functionCount)
+
+	merger := NewMerger(opts, fn)
 
 	errChan := make(chan error, 1)
 	go func() {
