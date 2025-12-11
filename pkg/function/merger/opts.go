@@ -1,7 +1,7 @@
 package main
 
 import (
-	"net"
+	"platform/pkg/function/utils"
 	"time"
 )
 
@@ -17,12 +17,7 @@ type MergerOpts struct {
 	PerInputBufferCap int
 
 	// 1:1 will be transported to TCP-Conn
-	TCPNoDelay        bool
-	TCPReadBuffer     int
-	TCPWriteBuffer    int
-	TCPKeepAlive      bool
-	TCPKeepAliveIdle  time.Duration
-	TCPKeepAliveIntvl time.Duration
+	utils.TCPOpts
 
 	ReadTimeout        time.Duration
 	WriteTimeout       time.Duration
@@ -51,12 +46,6 @@ func DefaultOpts(
 		ChunkSize:             64 * 1024,
 		ChannelBufferSize:     256,
 		PerInputBufferCap:     256 * 1024,
-		TCPNoDelay:            true,
-		TCPReadBuffer:         512 * 1024,
-		TCPWriteBuffer:        512 * 1024,
-		TCPKeepAlive:          true,
-		TCPKeepAliveIdle:      30 * time.Second,
-		TCPKeepAliveIntvl:     10 * time.Second,
 		ReadTimeout:           0,
 		WriteTimeout:          0,
 		WriteFlushInterval:    50 * time.Millisecond,
@@ -67,36 +56,6 @@ func DefaultOpts(
 		MetricsInterval:       0,
 		LogRateLimit:          0,
 		LogLevel:              "INFO",
-	}
-}
-
-type InputStream struct {
-	ID      string
-	conn    net.Conn
-	Ch      chan []byte
-	bytesIn int64
-	closed  chan struct{}
-}
-
-type OutputStream struct {
-	conn   net.Conn
-	Ch     chan []byte
-	closed chan struct{}
-}
-
-func NewInputStream(id string, conn net.Conn, chanSize int) *InputStream {
-	return &InputStream{
-		ID:     id,
-		conn:   conn,
-		Ch:     make(chan []byte, chanSize),
-		closed: make(chan struct{}),
-	}
-}
-
-func NewOutputStream(conn net.Conn, chanSize int) *OutputStream {
-	return &OutputStream{
-		conn:   conn,
-		Ch:     make(chan []byte, chanSize),
-		closed: make(chan struct{}),
+		TCPOpts:               utils.DefaultTCPOpts(),
 	}
 }

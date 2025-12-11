@@ -5,22 +5,11 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"platform/pkg/function/router"
+	"platform/pkg/function/utils"
 	"sync"
 	"time"
 )
-
-type MergeInstance struct {
-	id          string
-	ctx         context.Context
-	cancel      context.CancelFunc
-	inputChans  []chan []byte
-	producerIDs []string
-}
-
-type StreamRouter struct {
-	mu        sync.RWMutex
-	instances []*MergeInstance
-}
 
 type Merger struct {
 	opts *MergerOpts
@@ -29,10 +18,11 @@ type Merger struct {
 	inputsMu      sync.RWMutex
 	readyInit     sync.Once
 	readyCh       chan struct{}
-	inputs        map[string]*InputStream
+	inputs        map[string]*router.Stream
 	acceptSem     chan struct{}
-	OutputStream  *OutputStream
-	router        *StreamRouter
+	OutputStream  *router.Stream
+	router        *router.Router[*MergeInstance]
+	bufferPool    sync.Pool
 
 	metricsTicker *time.Ticker
 	lastLogTime   time.Time
@@ -40,32 +30,45 @@ type Merger struct {
 
 func NewMerger(opts *MergerOpts, mergeFunction func(context.Context, []chan []byte, chan []byte) error) *Merger {
 
-	inputs := make(map[string]*InputStream)
-	acceptSem := make(chan struct{}, opts.MaxInputFunctions)
-
-	return &Merger{
-		opts:          opts,
-		MergeFunction: mergeFunction,
-		inputs:        inputs,
-		acceptSem:     acceptSem,
-		readyCh:       make(chan struct{}),
+	m := Merger{
+		opts: opts,
 	}
+
+	m.inputs = make(map[string]*router.Stream)
+	m.acceptSem = make(chan struct{}, opts.MaxInputFunctions)
+
+	m.bufferPool = sync.Pool{
+		New: func() interface{} {
+			return &utils.PooledBuffer{
+				Data: make([]byte, opts.ChunkSize),
+				Pool: &m.bufferPool,
+			}
+		},
+	}
+
+	m.readyCh = make(chan struct{})
+	m.MergeFunction = mergeFunction
+
+	return &m
 }
 
+// Run handles the Merger's lifecycle. It first connects to the downstream function (can be a chained function, client, ...)
+// Then the connection gets "tuned" using the config of the merger, after that the writer starts writing to the downstream connection.
 func (m *Merger) Run() error {
 	log.Printf("started running merger")
 	out, err := net.Dial("tcp", m.opts.DownstreamAddr)
 	if err != nil {
 		return err
 	}
-	m.tuneTCP(out)
 
-	m.OutputStream = NewOutputStream(out, m.opts.ChannelBufferSize)
+	m.opts.TuneTCP(out)
+
+	m.OutputStream = router.NewStream(out.RemoteAddr().String(), out, m.opts.ChannelBufferSize)
 
 	go m.writer()
 	go func() {
 		defer out.Close()
-		<-m.OutputStream.closed
+		<-m.OutputStream.Closed
 	}()
 
 	listener, err := net.Listen("tcp", m.opts.InputListenerAddr)
@@ -85,7 +88,6 @@ func (m *Merger) Run() error {
 	<-m.readyCh
 
 	go func() {
-		log.Printf("starting merge function with inputs: %v and output: %v", m.inputs, m.OutputStream)
 		if err := m.handleMergeFunction(); err != nil {
 			errChan <- err
 		}
@@ -116,74 +118,30 @@ func (m *Merger) acceptLoop(listener net.Listener) error {
 }
 
 func (m *Merger) handleMergeFunction() error {
-	m.router = &StreamRouter{
-		instances: make([]*MergeInstance, 0),
-	}
+	m.router = router.NewRouter[*MergeInstance]()
 
 	instanceCounter := 0
 
 	for {
-		m.inputsMu.Lock()
-		snapshotProducers := make(map[string]*InputStream, len(m.inputs))
 
-		for id, stream := range m.inputs {
-			snapshotProducers[id] = stream
-		}
-		currentLen := len(m.inputs)
-		m.inputsMu.Unlock()
+		snapshot := m.snapshotProducers()
 
-		if currentLen == 0 {
+		// Switch from busy waiting
+		if len(snapshot) == 0 {
 			log.Printf("no inputs available")
-			time.Sleep(100 * time.Millisecond) // Change this, maybe to have a wake-up call
+			time.Sleep(100 * time.Millisecond)
 			continue
 		}
 
-		instanceID := fmt.Sprintf("merger-%d", instanceCounter)
+		instance := m.CreateInstance(instanceCounter, snapshot)
 		instanceCounter++
 
-		ctx, cancel := context.WithCancel(context.Background())
-
-		inputChans := make([]chan []byte, 0, len(snapshotProducers))
-		producerIDs := make([]string, 0, len(snapshotProducers))
-
-		for id, stream := range snapshotProducers {
-			ch := stream.Ch
-			inputChans = append(inputChans, ch)
-			producerIDs = append(producerIDs, id)
-		}
-
-		instance := &MergeInstance{
-			id:          instanceID,
-			ctx:         ctx,
-			cancel:      cancel,
-			inputChans:  inputChans,
-			producerIDs: producerIDs,
-		}
-
-		m.router.mu.Lock()
-		m.router.instances = append(m.router.instances, instance)
-		m.router.mu.Unlock()
-
-		log.Printf("starting merge instance: %s with %d inputs: %v", instanceID, len(producerIDs), producerIDs)
+		m.router.Mu.Lock()
+		m.router.Instances = append(m.router.Instances, &instance)
+		m.router.Mu.Unlock()
 
 		go func(inst *MergeInstance) {
-			defer func() {
-				m.router.mu.Lock()
-				for i, existing := range m.router.instances {
-					if existing.id == inst.id {
-						m.router.instances = append(m.router.instances[:i], m.router.instances[i+1:]...)
-						break
-					}
-				}
-
-				m.router.mu.Unlock()
-
-				for _, ch := range inst.inputChans {
-					close(ch)
-				}
-
-				log.Printf("merge instance %s cleaned up", inst.id)
-			}()
+			defer inst.ShutdownInstance()
 
 			log.Printf("[%s] invoking user merge function", inst.id)
 			if err := m.MergeFunction(inst.ctx, inst.inputChans, m.OutputStream.Ch); err != nil {
@@ -202,7 +160,7 @@ func (m *Merger) handleMergeFunction() error {
 				newLen := len(m.inputs)
 				m.inputsMu.Unlock()
 
-				if newLen != currentLen {
+				if newLen != len(snapshot) {
 					instance.cancel()
 
 					ticker.Stop()
@@ -223,7 +181,7 @@ func (m *Merger) handleNewProducer(conn net.Conn) {
 
 	id := conn.RemoteAddr().String()
 
-	stream := NewInputStream(id, conn, m.opts.ChannelBufferSize)
+	stream := router.NewStream(id, conn, m.opts.ChannelBufferSize)
 
 	m.inputsMu.Lock()
 	m.inputs[id] = stream
@@ -238,181 +196,91 @@ func (m *Merger) handleNewProducer(conn net.Conn) {
 
 	go m.reader(stream)
 
-	<-stream.closed
+	<-stream.Closed
 
 	m.inputsMu.Lock()
 	delete(m.inputs, id)
 	m.inputsMu.Unlock()
 }
 
-func (m *Merger) reader(s *InputStream) {
-	defer close(s.closed)
+func (m *Merger) reader(s *router.Stream) {
+	defer close(s.Closed)
 
 	log.Printf("starting to read from incoming conn: %v", s.ID)
-	buf := make([]byte, m.opts.ChunkSize)
 
 	for {
-		n, err := s.conn.Read(buf)
+
+		pooledBuf := m.getBuffer()
+
+		n, err := s.Conn.Read(pooledBuf.Data)
 		if n > 0 {
-			chunk := make([]byte, n)
-			copy(chunk, buf[:n])
-			//ID = RemoteAddr of the Conn
-			m.routeData(s.ID, chunk)
+			pooledBuf.Length = n
+			m.router.RouteData(s.ID, pooledBuf)
+		} else {
+			pooledBuf.Release()
 		}
 
 		if err != nil {
-			m.producerClosed(s.ID)
+			m.router.HandleClosedStream(s.ID)
 			return
 		}
 	}
 }
 
 func (m *Merger) writer() {
-	defer close(m.OutputStream.closed)
-	defer m.OutputStream.conn.Close()
+	defer close(m.OutputStream.Closed)
+	defer m.OutputStream.Conn.Close()
 
 	log.Printf("started writing to output-stream")
 
-	conn := m.OutputStream.conn
-	buf := make([]byte, m.opts.ChunkSize)
+	conn := m.OutputStream.Conn
 
-	flush := func() error {
-		if len(buf) == 0 {
-			return nil
+	for {
+		chunk, ok := <-m.OutputStream.Ch
+		if !ok {
+			return
 		}
 
 		if m.opts.WriteTimeout > 0 {
 			_ = conn.SetWriteDeadline(time.Now().Add(m.opts.WriteTimeout))
 		}
 
-		log.Printf("flushing buffer with length: %d", len(buf))
-		_, err := conn.Write(buf)
-		buf = buf[:0]
-		return err
-	}
-
-	for {
-		select {
-		case chunk := <-m.OutputStream.Ch:
-			log.Printf("fetched chunk with length: %d from output-chan", len(chunk))
-			if len(buf)+len(chunk) > cap(buf) {
-				if err := flush(); err != nil {
-					return
-				}
-			}
-
-			buf = append(buf, chunk...)
-
-		case <-time.After(m.opts.WriteFlushInterval):
-			if err := flush(); err != nil {
-				return
-			}
+		_, err := conn.Write(chunk)
+		if err != nil {
+			log.Printf("error occurred in writer: %v", err)
+			return
 		}
 	}
 }
 
-func (m *Merger) routeData(producerID string, chunk []byte) {
-	m.router.mu.RLock()
-	defer m.router.mu.RUnlock()
+func (m *Merger) CreateInstance(counter int, streams map[string]*router.Stream) *MergeInstance {
+	instanceID := fmt.Sprintf("merger-%d", counter)
 
-	for _, instance := range m.router.instances {
-		producerIndex := -1
-		for i, id := range instance.producerIDs {
-			if id == producerID {
-				producerIndex = i
-				break
-			}
-		}
+	ctx, cancel := context.WithCancel(context.Background())
 
-		if producerIndex == -1 {
-			continue
-		}
+	inputChans := make([]chan []byte, 0, len(streams))
+	producerIDs := make([]string, 0, len(streams))
 
-		select {
-		case <-instance.ctx.Done():
-			continue
-		case instance.inputChans[producerIndex] <- chunk:
-		default:
-			select {
-			case <-instance.ctx.Done():
-				continue
-			case instance.inputChans[producerIndex] <- chunk:
-				log.Printf("successfully sent after blocking")
-			case <-time.After(5 * time.Second):
-				log.Printf("ERROR: dropping data after timeout for %s", producerID)
-			}
-		}
+	for id, stream := range streams {
+		ch := stream.Ch
+		inputChans = append(inputChans, ch)
+		producerIDs = append(producerIDs, id)
 	}
+
+	return NewMergeInstance(instanceID, ctx, cancel, inputChans, producerIDs)
 }
 
-func (m *Merger) producerClosed(producerID string) {
-	m.router.mu.RLock()
-	defer m.router.mu.RUnlock()
+func (m *Merger) snapshotProducers() map[string]*router.Stream {
+	m.inputsMu.Lock()
+	defer m.inputsMu.Unlock()
 
-	for _, instance := range m.router.instances {
-		producerIndex := -1
-		for i, id := range instance.producerIDs {
-			if id == producerID {
-				producerIndex = i
-				break
-			}
-		}
-
-		if producerIndex >= 0 {
-			select {
-			case <-instance.ctx.Done():
-				log.Printf("instance is already closing")
-			default:
-				close(instance.inputChans[producerIndex])
-				log.Printf("closed input chan: %d in instance: %s for producer: %s", producerIndex, instance.id, producerID)
-			}
-		}
+	snapshotProducers := make(map[string]*router.Stream, len(m.inputs))
+	for id, stream := range m.inputs {
+		snapshotProducers[id] = stream
 	}
+	return snapshotProducers
 }
 
-func (m *Merger) tuneTCP(conn net.Conn) {
-	tcp, ok := conn.(*net.TCPConn)
-	if !ok {
-		return
-	}
-
-	if m.opts.TCPNoDelay {
-		err := tcp.SetNoDelay(true)
-		if err != nil {
-			log.Printf("failed to set tcp-conn: %v to no delay: %v", tcp.RemoteAddr(), err)
-			return
-		}
-	}
-
-	if m.opts.TCPReadBuffer > 0 {
-		err := tcp.SetReadBuffer(m.opts.TCPReadBuffer)
-		if err != nil {
-			log.Printf("failed to set read-buffer size for tcp-conn: %v, %v", tcp.RemoteAddr(), err)
-			return
-		}
-	}
-
-	if m.opts.TCPWriteBuffer > 0 {
-		err := tcp.SetWriteBuffer(m.opts.TCPWriteBuffer)
-		if err != nil {
-			log.Printf("failed to set write-buffer size for tcp-conn: %v, %v", tcp.RemoteAddr(), err)
-			return
-		}
-	}
-
-	if !m.opts.TCPKeepAlive {
-		return
-	}
-
-	keepAliveOpts := net.KeepAliveConfig{
-		Enable:   m.opts.TCPKeepAlive,
-		Idle:     m.opts.TCPKeepAliveIdle,
-		Interval: m.opts.TCPKeepAliveIntvl,
-	}
-
-	err := tcp.SetKeepAliveConfig(keepAliveOpts)
-	if err != nil {
-		log.Printf("failed to set keep alive config for tcp-conn: %v, %v", tcp.RemoteAddr(), err)
-		return
-	}
+func (m *Merger) getBuffer() *utils.PooledBuffer {
+	return m.bufferPool.Get().(*utils.PooledBuffer)
 }
