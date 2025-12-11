@@ -23,9 +23,6 @@ type Merger struct {
 	OutputStream  *router.Stream
 	router        *router.Router[*MergeInstance]
 	bufferPool    sync.Pool
-
-	metricsTicker *time.Ticker
-	lastLogTime   time.Time
 }
 
 func NewMerger(opts *MergerOpts, mergeFunction func(context.Context, []chan []byte, chan []byte) error) *Merger {

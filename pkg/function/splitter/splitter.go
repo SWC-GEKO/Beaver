@@ -1,47 +1,90 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
+	"maps"
 	"net"
+	"platform/pkg/function/router"
+	"platform/pkg/function/utils"
+	"sync"
+	"time"
 )
 
 type Splitter struct {
-	SplitFunction     func(in chan byte, out []chan byte) error
-	InputChannel      chan byte
-	OutputChannels    []chan byte
-	FixedFunctions    int
-	InputListenerPort string
-	FunctionsIPs      []string
+	opts *SplitterOpts
+
+	SplitFunction func(context.Context, chan []byte, []chan []byte) error
+	outputMu      sync.RWMutex
+	readyCh       chan struct{}
+	outputs       map[string]*router.Stream
+	InputStream   *router.Stream
+	router        *router.Router[*SplitInstance]
+	bufferPool    sync.Pool
 }
 
 func NewSplitter(
-	splitFunction func(chan byte, []chan byte) error,
-	fixedFunction int,
-	inputListenerPort string,
-	functionIPs []string,
+	opts *SplitterOpts,
+	splitFunction func(context.Context, chan []byte, []chan []byte) error,
 ) *Splitter {
 
-	inputChannel := make(chan byte)
-	outputChannels := make([]chan byte, fixedFunction)
-
-	for i := 0; i < len(outputChannels); i++ {
-		outputChannels[i] = make(chan byte)
+	s := Splitter{
+		opts: opts,
 	}
 
-	return &Splitter{
-		SplitFunction:     splitFunction,
-		InputChannel:      inputChannel,
-		OutputChannels:    outputChannels,
-		FixedFunctions:    fixedFunction,
-		InputListenerPort: inputListenerPort,
-		FunctionsIPs:      functionIPs,
+	s.outputs = make(map[string]*router.Stream, s.opts.MaxOutputFunctions)
+
+	s.bufferPool = sync.Pool{
+		New: func() interface{} {
+			return &utils.PooledBuffer{
+				Data: make([]byte, opts.ChunkSize),
+				Pool: &s.bufferPool,
+			}
+		},
 	}
+
+	s.readyCh = make(chan struct{})
+	s.SplitFunction = splitFunction
+
+	return &s
+}
+
+func (s *Splitter) DiscoverFunctions() (map[string]*router.Stream, error) {
+	functionIPs, err := net.LookupHost(s.opts.FunctionName)
+	if err != nil {
+		return nil, err
+	}
+
+	functions := make(map[string]*router.Stream, len(functionIPs))
+	for _, ip := range functionIPs {
+		fn, err := s.connectToFunction(ip)
+		if err != nil {
+			return nil, err
+		}
+
+		functions[ip] = fn
+
+		go s.Writer(fn)
+	}
+
+	return functions, nil
+}
+
+func (s *Splitter) connectToFunction(ip string) (*router.Stream, error) {
+	conn, err := net.Dial("tcp", fmt.Sprint(ip, s.opts.FunctionPort))
+	if err != nil {
+		return nil, err
+	}
+
+	s.opts.TuneTCP(conn)
+
+	stream := router.NewStream(ip, conn, s.opts.ChunkSize)
+	return stream, nil
 }
 
 func (s *Splitter) Run() error {
-
-	inputListener, err := net.Listen("tcp", s.InputListenerPort)
+	inputListener, err := net.Listen("tcp", s.opts.InputListenerAddr)
 	if err != nil {
 		return fmt.Errorf("connecting to upstream operator failed with error: %v", err)
 	}
@@ -49,90 +92,181 @@ func (s *Splitter) Run() error {
 
 	log.Printf("started listening on: %v", inputListener.Addr())
 
-	var fnConnections []net.Conn
-	for _, fn := range s.FunctionsIPs {
-		fnConn, err := net.Dial("tcp", fn+":8000")
-		if err != nil {
-			for _, c := range fnConnections {
-				c.Close()
-			}
-			return fmt.Errorf("connecting to function failed with err: %v", err)
-		}
-		defer fnConn.Close()
-
-		fnConnections = append(fnConnections, fnConn)
-	}
-
 	upstreamConn, err := inputListener.Accept()
 	if err != nil {
 		return fmt.Errorf("accepting upstream connection failed with error: %v", err)
 	}
 
-	if err := s.HandleConnections(upstreamConn, fnConnections); err != nil {
-		return fmt.Errorf("handling connections failed with error")
-	}
+	s.opts.TuneTCP(upstreamConn)
+	s.InputStream = router.NewStream(upstreamConn.RemoteAddr().String(), upstreamConn, s.opts.ChunkSize)
+
+	go s.HandleConsumers()
+
+	go s.HandleProducer()
+
+	go s.HandleSplitFunction()
 
 	return nil
 }
 
-func (s *Splitter) HandleConnections(upstreamConn net.Conn, functionConns []net.Conn) error {
-
-	errChan := make(chan error)
-	go func() {
-		log.Printf("Input-Channel: %v", s.InputChannel)
-		if err := handleIncomingBytes(upstreamConn, s.InputChannel); err != nil {
-			errChan <- err
-		}
-	}()
-
-	go func() {
-		log.Printf("starting the split function: InputChan: %v, OutputChans: %v", s.InputChannel, s.OutputChannels)
-		if err := s.SplitFunction(s.InputChannel, s.OutputChannels); err != nil {
-			errChan <- err
-		}
-	}()
-
-	// This will cause a problem when our len(outputChannels) > len(fnConns)
-	for i, ch := range s.OutputChannels {
-		fn := functionConns[i]
-		channel := ch
-		go func() {
-			if err := writeBytesToFunction(channel, fn); err != nil {
-				errChan <- err
+func (s *Splitter) HandleConsumers() {
+	ticker := time.NewTicker(100 * time.Millisecond)
+	for {
+		select {
+		case <-ticker.C:
+			functions, err := s.DiscoverFunctions() // connects to function as well
+			if err != nil {
+				return
 			}
-		}()
-	}
 
-	select {
-	case err := <-errChan:
-		log.Printf("error occured in: %v", err)
-		return err
-	}
-}
+			if maps.Equal(s.outputs, functions) {
+				continue
+			}
 
-func handleIncomingBytes(upstreamConn net.Conn, inputChan chan byte) error {
-	for {
-		buf := make([]byte, 1)
-		_, err := upstreamConn.Read(buf)
-		if err != nil {
-			return fmt.Errorf("reading from upstream connection failed with error: %v", err)
+			s.outputMu.Lock()
+			s.outputs = functions
+			s.outputMu.Unlock()
 		}
-
-		inputChan <- buf[0]
 	}
 }
 
-func writeBytesToFunction(outputChan chan byte, functionConn net.Conn) error {
+func (s *Splitter) Writer(stream *router.Stream) {
+	defer close(stream.Ch)
 	for {
-		b, ok := <-outputChan
+		chunk, ok := <-stream.Ch
 		if !ok {
-			log.Printf("output: reading from outputChan failed")
-			return nil
+			return
 		}
 
-		_, err := functionConn.Write([]byte{b})
+		if s.opts.WriterTimeout > 0 {
+			stream.Conn.SetWriteDeadline(time.Now().Add(s.opts.WriterTimeout))
+		}
+
+		n, err := stream.Conn.Write(chunk)
 		if err != nil {
-			return fmt.Errorf("writing to function with IP: %s failed with err: %v", functionConn.RemoteAddr(), err)
+			return
+		}
+
+		stream.StreamedBytes += int64(n)
+	}
+}
+
+func (s *Splitter) HandleSplitFunction() error {
+	s.router = router.NewRouter[*SplitInstance]()
+
+	instanceCounter := 0
+
+	for {
+		snapshot := s.snapshotConsumers()
+
+		if len(snapshot) == 0 {
+			log.Printf("no outputs available")
+			time.Sleep(100 * time.Millisecond)
+			continue
+		}
+
+		instance := s.CreateInstance(instanceCounter, snapshot)
+
+		s.router.Mu.Lock()
+		s.router.Instances = append(s.router.Instances, &instance)
+		s.router.Mu.Unlock()
+
+		go func(inst *SplitInstance) {
+			defer inst.ShutdownInstance()
+
+			if err := s.SplitFunction(inst.ctx, s.InputStream.Ch, inst.outputChans); err != nil {
+				log.Printf("error occurred when executing split function [%s]: %v", inst.id, err)
+				return
+			}
+
+			log.Printf("[%s] split function exited", inst.id)
+
+		}(instance)
+
+		ticker := time.NewTicker(100 * time.Millisecond)
+
+	monitorLoop:
+		for {
+			select {
+			case <-ticker.C:
+				s.outputMu.Lock()
+				newLen := len(s.outputs)
+				s.outputMu.Unlock()
+
+				if newLen != len(snapshot) {
+					instance.cancel()
+
+					ticker.Stop()
+					break monitorLoop
+				}
+			}
 		}
 	}
+}
+
+func (s *Splitter) CreateInstance(counter int, snapshot map[string]*router.Stream) *SplitInstance {
+	instanceID := fmt.Sprintf("splitter-%d", counter)
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	outputChans := make([]chan []byte, 0, len(snapshot))
+	consumerIDs := make([]string, 0, len(snapshot))
+
+	for id, stream := range snapshot {
+		outputChans = append(outputChans, stream.Ch)
+		consumerIDs = append(consumerIDs, id)
+	}
+
+	instance := SplitInstance{
+		id:          instanceID,
+		ctx:         ctx,
+		cancel:      cancel,
+		outputChans: outputChans,
+		consumerIDs: consumerIDs,
+	}
+
+	return &instance
+}
+
+func (s *Splitter) snapshotConsumers() map[string]*router.Stream {
+	s.outputMu.Lock()
+	defer s.outputMu.Unlock()
+
+	snapshotConsumer := make(map[string]*router.Stream, len(s.outputs))
+	for id, stream := range s.outputs {
+		snapshotConsumer[id] = stream
+	}
+
+	return snapshotConsumer
+}
+
+func (s *Splitter) HandleProducer() {
+	go s.Reader(s.InputStream)
+
+	<-s.InputStream.Closed
+}
+
+func (s *Splitter) Reader(stream *router.Stream) {
+	defer close(stream.Closed)
+
+	for {
+		pooledBuf := s.getBuffer()
+
+		n, err := stream.Conn.Read(pooledBuf.Data)
+		if n > 0 {
+			pooledBuf.Length = n
+			s.router.RouteData(stream.ID, pooledBuf)
+		} else {
+			pooledBuf.Release()
+		}
+
+		if err != nil {
+			s.router.HandleClosedStream(stream.ID)
+			return
+		}
+	}
+}
+
+func (s *Splitter) getBuffer() *utils.PooledBuffer {
+	return s.bufferPool.Get().(*utils.PooledBuffer)
 }
